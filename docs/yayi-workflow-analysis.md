@@ -250,3 +250,187 @@
 5. 输出《上线前测试用例（功能/性能/合规）》
 
 这样你就能从“方案说明”快速进入“可开发执行”的阶段。
+
+---
+
+## 10. MVP 功能清单（按周排期，可直接进入研发）
+
+### 10.1 P0（必须上线）
+
+| 周次 | 能力 | 交付项 | 验收标准 |
+|---|---|---|---|
+| W1 | 审核中枢基础 | 登录、任务列表、任务详情、通过/驳回 | 可完成单任务审核闭环 |
+| W2 | 状态机与调度 | Topic→Assets→Edit→Publish 全链路状态流转 | 任务状态可追踪、可回放 |
+| W3 | 通知与告警 | 钉钉/企微通知，紧急告警 | 关键节点 1 分钟内通知到人 |
+| W4 | 选题生成 | 每日22:00产出5个选题 | 生成时延 < 5 分钟 |
+| W5 | 脚本与分镜 | 每选题输出脚本+分镜 | 支持“局部重写” |
+| W6 | 素材并行生成 | 并发3选题，镜头3版本 | 失败任务可自动重试 |
+| W7 | 审核批处理 | 镜头级批量通过/重生成 | 批量操作成功率 > 99% |
+| W8 | 自动剪辑 | 抖音/视频号/小红书版本输出 | 单条渲染 < 15 分钟 |
+| W9 | 发布排期 | 排期确认、人工最终发布 | 支持发布前最后审校 |
+| W10 | 发布回传 | 播放、完播、互动、涨粉回流 | 回流延迟 < 10 分钟 |
+| W11 | 数据看板 | 每日产能、审核耗时、通过率 | 指标口径一致 |
+| W12 | 灰度试运行 | 1个账号先跑，问题复盘 | 连续7天稳定运行 |
+
+### 10.2 P1（增强项）
+- 评论自动回复建议（人工确认后发送）
+- 追投策略推荐（含预算区间）
+- 偏好学习（按审核员偏好排序候选）
+- AB实验自动归因（封面/标题/钩子分层）
+
+---
+
+## 11. 数据库表结构草案（核心最小集）
+
+### 11.1 工作流与审核
+
+1. `content_project`
+- `id`（PK）
+- `topic_id`（选题ID）
+- `status`（枚举：TopicGenerated...Published）
+- `priority`（P0/P1/P2）
+- `owner_user_id`
+- `created_at`, `updated_at`
+
+2. `review_task`
+- `id`（PK）
+- `project_id`（FK）
+- `task_type`（topic/assets/edit/publish）
+- `task_payload`（JSON）
+- `sla_deadline`
+- `status`（pending/approved/rejected/rework）
+- `assignee_user_id`
+- `created_at`, `updated_at`
+
+3. `review_decision`
+- `id`（PK）
+- `review_task_id`（FK）
+- `decision`（approve/reject/rework/escalate）
+- `decision_note`
+- `operator_user_id`
+- `snapshot`（JSON：模型版本/提示词/素材版本）
+- `created_at`
+
+### 11.2 内容生产
+
+4. `topic_candidate`
+- `id`（PK）
+- `project_id`（FK）
+- `platform`（xiaohongshu/douyin/wechat_channels）
+- `title`
+- `audience`
+- `pain_point`
+- `score_predict`
+- `risk_flags`（JSON）
+
+5. `script_version`
+- `id`（PK）
+- `topic_candidate_id`（FK）
+- `version_no`
+- `script_text`
+- `storyboard`（JSON）
+- `is_selected`
+
+6. `asset_item`
+- `id`（PK）
+- `project_id`（FK）
+- `scene_no`
+- `variant_no`
+- `asset_type`（video/image/audio/subtitle）
+- `storage_url`
+- `meta`（JSON：分辨率/时长/BPM等）
+- `status`
+
+7. `edit_version`
+- `id`（PK）
+- `project_id`（FK）
+- `platform`
+- `version_no`
+- `video_url`
+- `cover_url`
+- `caption_text`
+- `predict_metrics`（JSON）
+- `is_selected`
+
+### 11.3 发布与监控
+
+8. `publish_job`
+- `id`（PK）
+- `project_id`（FK）
+- `platform`
+- `account_id`
+- `schedule_time`
+- `publish_status`（scheduled/success/failed/canceled）
+- `platform_post_id`
+- `error_message`
+
+9. `performance_daily`
+- `id`（PK）
+- `publish_job_id`（FK）
+- `date`
+- `impressions`
+- `plays`
+- `completion_rate`
+- `likes`
+- `comments`
+- `shares`
+- `followers_gain`
+
+10. `audit_log`
+- `id`（PK）
+- `actor_user_id`
+- `action`
+- `resource_type`
+- `resource_id`
+- `before_data`（JSON）
+- `after_data`（JSON）
+- `created_at`
+
+---
+
+## 12. 三平台发布字段映射清单（首版）
+
+| 统一字段 | 小红书 | 抖音 | 视频号 | 备注 |
+|---|---|---|---|---|
+| `title` | 标题 | 标题/文案首句 | 标题 | 小红书标题权重最高 |
+| `caption` | 正文文案 | 视频文案 | 描述文案 | 统一存储，平台侧再裁剪 |
+| `cover_image` | 封面图 | 封面图 | 封面图 | 建议统一 9:16 主图 |
+| `video_file` | 视频文件 | 视频文件 | 视频文件 | 保留原始母版+平台转码版 |
+| `hashtags` | 话题标签 | 话题标签 | 话题标签 | 平台数量限制不同 |
+| `publish_time` | 发布时间 | 发布时间 | 发布时间 | 排期由 `publish_job` 维护 |
+| `location` | 可选定位 | 可选定位 | 可选定位 | 涉及门店可启用 |
+| `comment_policy` | 评论设置 | 评论设置 | 评论设置 | 默认开启，异常时关闭 |
+| `music_id` | 背景音乐 | 背景音乐 | 背景音乐 | 版权合规检查必过 |
+| `product_link` | 商品/店铺链接 | 商品锚点 | 小商店/链接 | 电商场景必填 |
+
+---
+
+## 13. 上线前测试用例（功能 / 性能 / 合规）
+
+### 13.1 功能测试
+- 用例 F-01：22:00 定时触发后，5 个选题在 5 分钟内生成。
+- 用例 F-02：审核员可对选题执行“通过/驳回/局部重写”。
+- 用例 F-03：素材镜头支持批量通过、单镜头重生成。
+- 用例 F-04：三平台版本均可生成并进入待发布。
+- 用例 F-05：发布失败后自动重试并告警。
+
+### 13.2 性能测试
+- 用例 P-01：并发 3 个选题生成素材，队列无明显积压。
+- 用例 P-02：单视频渲染时长稳定 < 15 分钟。
+- 用例 P-03：任务看板在 2000 条任务下查询 < 2 秒。
+
+### 13.3 合规测试
+- 用例 C-01：敏感词/违禁词命中后禁止进入发布。
+- 用例 C-02：未授权角色无法执行“最终发布”。
+- 用例 C-03：发布、下架、删除操作均有审计日志。
+- 用例 C-04：素材版权风险命中后触发阻断与替换建议。
+
+---
+
+## 14. 建议的下一步（你确认后我可继续输出）
+
+1. 《审核中枢 Web 页面低保真原型（含移动端交互）》
+2. 《状态机 API 草案（接口+状态码+错误码）》
+3. 《任务队列与重试补偿策略（含死信队列）》
+4. 《数据看板 SQL 指标口径与计算公式》
+5. 《小红书/抖音/视频号 运营策略模板（按品类）》
