@@ -655,3 +655,216 @@
   - `response_code`
   - `resource_before` / `resource_after`
 
+
+---
+
+## 17. 任务队列与重试补偿策略（含死信队列）
+
+### 17.1 队列分层设计
+建议按业务阶段拆分队列，避免“一个队列堵死全链路”：
+
+1. `q.topic.generate`：选题与脚本生成
+2. `q.assets.generate`：素材生成（GPU/渲染密集）
+3. `q.edit.render`：自动剪辑与导出
+4. `q.publish.submit`：平台发布提交
+5. `q.metrics.pull`：发布后数据回流
+6. `q.notify.dispatch`：通知分发
+
+### 17.2 消息结构（统一 envelope）
+```json
+{
+  "message_id": "msg_xxx",
+  "trace_id": "tr_xxx",
+  "project_id": "p_123",
+  "task_type": "assets.generate",
+  "payload": {},
+  "retry_count": 0,
+  "max_retry": 5,
+  "next_retry_at": "2026-03-12T10:00:00+08:00",
+  "created_at": "2026-03-12T09:59:00+08:00"
+}
+```
+
+### 17.3 重试策略（分错误类型）
+- 可重试错误：网络抖动、下游超时、平台 5xx、限流 429
+- 不可重试错误：参数非法、权限不足、内容风控拒绝
+
+建议指数退避 + 抖动：
+- 第1次：30秒
+- 第2次：2分钟
+- 第3次：5分钟
+- 第4次：15分钟
+- 第5次：30分钟（最后一次）
+
+超出 `max_retry` 后进入 `DLQ`（死信队列）。
+
+### 17.4 补偿策略（Saga 思路）
+
+| 场景 | 失败点 | 补偿动作 |
+|---|---|---|
+| 发布中断 | 平台返回失败 | 回滚为 `ReadyToPublish`，通知人工重试 |
+| 剪辑失败 | 渲染超时 | 回退到 `AssetsApproved`，重建渲染任务 |
+| 素材缺失 | 单镜头生成失败 | 仅回滚失败镜头，保持其余镜头结果 |
+| 数据回流失败 | 平台指标接口不可用 | 标记待回补，定时补拉 |
+
+### 17.5 死信队列（DLQ）处理机制
+- DLQ 队列：`q.dlq.workflow`
+- 触发告警：
+  - 同一项目 10 分钟内 DLQ > 3
+  - 同一平台 30 分钟内 DLQ > 20
+- 人工处理动作：
+  - `retry_now`（立即重投）
+  - `discard`（丢弃并记录原因）
+  - `manual_takeover`（转人工流程）
+
+### 17.6 幂等与去重
+- 生产侧：`message_id` 全局唯一
+- 消费侧：以 `idempotency_key = task_type + project_id + scene_no + version_no` 去重
+- 发布侧：同一 `publish_job_id` 多次提交只允许一次成功
+
+---
+
+## 18. 数据看板 SQL 指标口径与计算公式
+
+> 说明：以下以 `performance_daily`、`publish_job`、`review_task`、`review_decision` 为基础表，SQL 为示意（可按 MySQL/PostgreSQL 微调）。
+
+### 18.1 核心指标定义
+1. `daily_output_count`：当日成功发布内容数
+2. `avg_review_time_min`：审核任务平均处理时长（分钟）
+3. `review_pass_rate`：审核通过率
+4. `avg_completion_rate`：平均完播率
+5. `engagement_rate`：互动率 = (点赞+评论+分享)/播放
+6. `followers_gain_total`：当日涨粉总量
+7. `publish_success_rate`：发布成功率
+8. `sla_on_time_rate`：SLA按时完成率
+
+### 18.2 SQL 示例
+
+#### A. 当日成功发布数
+```sql
+SELECT COUNT(*) AS daily_output_count
+FROM publish_job
+WHERE publish_status = 'success'
+  AND DATE(schedule_time) = CURRENT_DATE;
+```
+
+#### B. 发布成功率
+```sql
+SELECT
+  SUM(CASE WHEN publish_status = 'success' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS publish_success_rate
+FROM publish_job
+WHERE DATE(schedule_time) = CURRENT_DATE;
+```
+
+#### C. 审核通过率
+```sql
+SELECT
+  SUM(CASE WHEN decision = 'approve' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS review_pass_rate
+FROM review_decision
+WHERE DATE(created_at) = CURRENT_DATE;
+```
+
+#### D. 平均审核耗时（分钟）
+```sql
+SELECT AVG(TIMESTAMPDIFF(MINUTE, rt.created_at, rd.created_at)) AS avg_review_time_min
+FROM review_task rt
+JOIN review_decision rd ON rd.review_task_id = rt.id
+WHERE DATE(rd.created_at) = CURRENT_DATE;
+```
+
+#### E. 平均完播率与互动率
+```sql
+SELECT
+  AVG(completion_rate) AS avg_completion_rate,
+  SUM(likes + comments + shares) * 1.0 / NULLIF(SUM(plays), 0) AS engagement_rate
+FROM performance_daily
+WHERE date = CURRENT_DATE;
+```
+
+#### F. SLA 按时率
+```sql
+SELECT
+  SUM(CASE WHEN rd.created_at <= rt.sla_deadline THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS sla_on_time_rate
+FROM review_task rt
+JOIN review_decision rd ON rd.review_task_id = rt.id
+WHERE DATE(rd.created_at) = CURRENT_DATE;
+```
+
+### 18.3 看板分层建议
+- 管理层：产能、成功率、违规率、成本
+- 运营层：选题通过率、平台表现、最佳发布时间
+- 执行层：待处理任务、超时任务、DLQ任务、异常告警
+
+---
+
+## 19. 小红书 / 抖音 / 视频号运营策略模板（按品类）
+
+### 19.1 通用模板字段
+- `content_goal`：涨粉 / 转化 / 品牌认知
+- `audience_segment`：目标人群
+- `hook_3s`：前3秒钩子
+- `value_structure`：内容结构（问题-方案-证明-行动）
+- `cta`：引导动作（评论/私信/收藏/下单）
+- `risk_notes`：平台与合规风险提示
+
+### 19.2 品类模板A：塑形知识科普
+
+#### 小红书
+- 标题：问题式 + 结果承诺（避免绝对化）
+- 封面：前后对比 + 关键词贴纸
+- 正文：
+  1) 常见误区
+  2) 正确动作要点
+  3) 7天执行清单
+- CTA：收藏 + 打卡
+
+#### 抖音
+- 前3秒：反常识结论 + 动作演示
+- 节奏：15-35秒，强字幕节拍
+- 结尾：评论区领取动作表
+
+#### 视频号
+- 时长：40-90秒
+- 结构：原理解释 + 动作示范 + 注意事项
+- CTA：关注系列内容
+
+### 19.3 品类模板B：用户见证与案例
+
+#### 小红书
+- 标题：`真实用户第X天变化` 类型
+- 内容：背景 -> 过程 -> 结果 -> 注意事项
+- 风险：避免“保证效果”表达
+
+#### 抖音
+- 开头：结果先行（前后变化）
+- 中段：关键动作片段
+- 结尾：引导评论关键词获取方案
+
+#### 视频号
+- 强调可信度：时间线、方法论、边界说明
+- 支持挂合集形成连续观看
+
+### 19.4 品类模板C：课程/服务转化
+
+#### 小红书
+- 重点：可收藏清单 + 场景化痛点
+- 建议：图文+短视频双形态联动
+
+#### 抖音
+- 重点：单一强卖点 + 限时动作引导
+- 建议：A/B 测试不同开场承诺句
+
+#### 视频号
+- 重点：直播/社群承接
+- 建议：视频结尾加入下一步行动路径
+
+### 19.5 发布节奏建议（首版）
+- 每日 3-6 条：
+  - 1 条科普（拉新）
+  - 1-2 条案例（信任）
+  - 1 条转化（成交）
+  - 余量做热点快速响应
+- 周维度复盘：
+  - 淘汰后 30% 素材模板
+  - 放大前 20% 表现主题
+
